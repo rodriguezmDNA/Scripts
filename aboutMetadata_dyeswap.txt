@@ -1,0 +1,15 @@
+###About the metadata (or <<targets>> file) on dye swap experiments.
+## A dye swap experiment consists of a comparison between two samples (eg, mutantVSwt) done on at least two arrays. In one, the comparison is done one way (eg, green channel is WT, red channel is MUT) while the other array is reciprocal (green channel is MUT, red channel is now WT).
+# Rows are the filenames (gpr files) of the arays.
+# It must contain two columns (Cy3 and Cy5) indicating which sample is on which channel.
+# Another important column is the Comparison (or parameters) that indicate the type of contrast being made (regardless of the direction of the samples). Ie., If we have two treatments A and B, being compared against a control C, a metadata table would look like this:
+
+# | File | Cy3 | Cy5 | Comparison | Extra |
+# | ---- | --- | --- |    ---     |  ---  |
+# | F1   |  A  |  C  |     AC     |  AvCrep1|
+# | F2   |  C  |  A  |     AC     |  CvArep1|
+# | F3   |  A  |  C  |     AC     |  AvCrep2|
+# | Fn   |  B  |  C  |     BC     |  BvCrep1|
+
+# The column Comparison is going to indicate the group to which each array belongs and is used for the design of a model matrix.
+# Since the contrast is already made on the array, we don't need a contrast matrix. We just fit the data and calculate DE genes from the coefficients ()

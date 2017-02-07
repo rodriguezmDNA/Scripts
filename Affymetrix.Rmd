@@ -1,0 +1,670 @@
+---
+title: "R markdown microarray analysis - Affymetrix"
+output: html_document
+# author: jrm
+#S Brady lab @ UC Davis
+#jrodriguezm at ucdavis dot edu
+#github: rodriguezmDNA
+---
+
+```{r set variables, echo=TRUE}
+paste("User controlled variables") 
+# 
+WD="" #Working directory
+inDir="" #Main folder. Must have a directory with CEL files named "CELFiles".
+control='' #Name of control sample
+# AGI of genes of interest to visualize expressiona across Sample.
+GOI <- c("","","") #Vector of AGI identifiers, eg AT1G####
+#
+ANOVA = T #Do ANOVA or test individual contrasts? Recommended: ANOVA
+pheno=T #Is there metadata? CSV file associating name files with details of the experiment named "meta.csv" on the root folder of the analysis.
+IQRfilter = F #Filter by IQR on expression. Decreases number of DE genes.
+doWeights <- TRUE
+doVenn <- T
+options(digits=4)
+availPrevResults <- F
+```
+
+#### Setting local parameters
+```{r localparameters , echo=TRUE}
+# -- Adapt these according to analysis
+setwd(WD)
+celPath=paste(inDir,"CELFiles",sep="")
+inPattern='.CEL'
+#
+```
+
+```{r functions, include=F}
+# This function will take a vector of names, find a combination of colors suitable and autmoatically assign a color to them
+
+selectColors <- function(mylittlevector) {
+  tmpUniq <- unique(mylittlevector)
+  if (length(tmpUniq) <= 3){
+    ColorSelected <- rainbow(length(tmpUniq))
+    
+  } else {
+  tmp <- rownames(brewer.pal.info[length(tmpUniq) <= brewer.pal.info$maxcolors,])
+  RandColor <- sample(tmp,1) #Randomly select one combination
+  ColorSelected <- brewer.pal(length(tmpUniq),RandColor)
+  
+  }
+  names(ColorSelected) <- tmpUniq
+  ColorSelected <- ColorSelected[mylittlevector]
+  return(ColorSelected)}
+
+testPalette <- function(mypalette){pie(rep(1, length(mypalette)),col = mypalette)}
+# Use in code: 
+n = 42
+left <- rgb(60:0/60,60:0/60,0.45)
+left <- left[1:n]
+testPalette(left)
+
+center <- "white"
+testPalette(center)
+#
+right <- rgb(0.45,60:0/60,60:0/60)
+right <- right[1:n]
+testPalette(right)
+
+hmPalette  <- c(rev(left),center,right)
+testPalette(hmPalette)
+
+## Heatmap function
+hmFunction <- function(hmMatrix,clrPalette,relSize,hmName) {
+  mylmat = rbind(c(4,3,0),
+                 c(2,1,0),
+                 c(0,5,0)) # creates 3x3 table with location of heatmap elements defined
+  mylwid = c(1,4,0.1)
+  mylhei = c(0.15,4,0.4)
+  par(#mar=c(4,2,4,2),
+    oma=c(2,4,1,0),
+    cex.main=1)
+  heatmap.2(hmMatrix, dendrogram ='row',
+            Colv=T, col=clrPalette, 
+            key=T, keysize=0.9, symkey=T, density.info='none',
+            trace='none', 
+            colsep=rep(1:ncol(hmData)),
+            
+            #rowsep=rep(1:nrow(hmData)),
+            sepcolor='white', sepwidth=c(0.025),
+            scale="none",
+            cexRow=relSize,#srtRow = 45,
+            cexCol=2,srtCol=45,
+            
+            #
+            margins = c(2,8),
+            #
+            #hclustfun=function(c){hclust(c, method='mcquitty')},
+            lmat=mylmat, 
+            lhei = mylhei, 
+            lwid = mylwid,
+            main=hmName)
+}
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#knitr::opts_chunk$set(comment=NA, fig.width=9, fig.height=9)
+knitr::opts_knit$set(root.dir = normalizePath(WD))
+```
+
+
+#MA analysis report for files in `r inDir`
+
+####Library loading
+```{r, message=F, warning=F} 
+library(limma)
+library(KEGG.db)
+library(GO.db)
+library(gplots)
+library(RColorBrewer)
+library(affy)
+library("genefilter")
+library(arrayQualityMetrics)
+library(ath1121501cdf)
+library(ath1121501.db) 
+library(reshape)
+library(ggplot2)
+library(pvclust)
+#install.packages("calibrate")
+library(calibrate) #For the custom volcano plots
+``` 
+
+
+#### Setting destination folders
+```{r out parameters , echo=TRUE}
+ResultsQC  <- paste(inDir,"00_QualityControl",sep="/")
+dir.create(ResultsQC, showWarnings=T)
+
+#ArrayQC <- paste(ResultsQC,"Normalized_Filtered_QC",sep="/")
+#dir.create(ArrayQC, showWarnings=T)
+
+ResultsNorm  <- paste(inDir,"01_NormalizedData",sep="/")
+dir.create(ResultsNorm, showWarnings=T)
+
+Images  <- paste(inDir,"images",sep="/")
+dir.create(Images, showWarnings=T)
+
+DiffExprPath  <- paste(inDir,"02_DifferentialExpression",sep="/")
+dir.create(DiffExprPath, showWarnings=T)
+# -- --
+```
+
+
+### Preparing metadata from CEL file names.
+Using regular expressions to break down the names of file names
+to create the metadata (phenotypic data) table. 
+
+```{r metadata , echo=TRUE}
+if (pheno){
+  #If a file already exists
+  metaPath <- paste(inDir,"metadata.csv",sep="/") #CSV file with the logFC of significant genes.
+  meta <- read.csv(metaPath,as.is = T,stringsAsFactors = F)
+  
+  #Reorder alphabetically by Name
+  ReorderIdx <- order(meta$Name)
+  meta <- meta[ReorderIdx,]
+  head(meta)
+  # Extract important info
+  Names <- meta$Name
+  Sample <- meta$Sample
+  Genotype <- meta$Genotype
+  
+} else { 
+  #Create the metadata table out of the file  names
+  files = dir(celPath,pattern = inPattern,full.names = T)
+### metadata
+## -- Naming Sample
+# Clean and elegant (and automatized): 
+Names <- basename(files)
+Names <- gsub("-","_",Names) #To avoid problems with contrasts
+## Remove "GSM" along with all numbers until first underscore as well as file suffix. 
+# Makes naming files easier. 
+Names <- gsub("^GSM[0-9]*_|.CEL|.gz","",Names) 
+head(Names)
+Sample <- gsub("_[0-9].*$","",Names)
+
+cat(
+  "Sample processed:\n", 
+  paste (Names,collapse = "\n", sep="")
+)
+
+# Add to affyData object
+phenoData <- as.data.frame(do.call(rbind,strsplit(Names,split = "_")))
+
+# Do some rearrangements, only if necessary, otherwise comment this block:   
+phenoData[,1] <- apply(phenoData[,c(1,2)],1,paste,collapse = "_")
+phenoData <- phenoData[,-2]
+colnames(phenoData) <- c("Genotype","Replicate")
+# -
+
+
+meta <- as.data.frame(cbind(phenoData,
+                      "Names"=Names,
+                      "Sample"=Sample,
+                      "Files"=basename(files)))
+
+head (meta)
+# Save metadata to file in case it needs revision
+tmpFileName <- paste(inDir,"/metadata1.csv",sep="")
+paste("Writing metadata file:",tmpFileName)
+write.csv(meta, file = tmpFileName,
+            row.names = T, quote=F)
+
+colnames(meta)
+}
+head(meta)
+```
+
+
+### "Performing RMA normalization\n"
+```{r RMA , echo=F}
+print("justRMA") ## Gives normalized values
+# Check all CEL files in folder
+Files <- dir(celPath,pattern = ".CEL")
+# Only use files in meta data
+Files <- Files[grep(paste(meta$File,collapse = "|"),Files)]
+# Read them in the order of the metadata table
+Files <- Files[ReorderIdx]
+eset <- justRMA(filenames=Files, celfile.path=celPath, sampleNames=meta$Name)
+pData(eset) <- meta
+```
+
+### Filtering
+Sarting number of probes in the array: `r nrow(eset)` 
+Removing `r sum(grepl("^AFFX", featureNames(eset)))` control probes
+```{r filtering controls , echo=F}
+# Remove controls
+eset <- eset[!grepl("^AFFX", featureNames(eset)),]
+```
+
+Probes after removing controls:  `r nrow(eset)` 
+Removing probes with no AGI identifier
+```{r filtering without AGI, echo=F}
+AGI <- mget(featureNames(eset),ath1121501ACCNUM,ifnotfound=NA)
+eset <- eset[(which(!is.na(AGI)))]
+```
+Left after removing probes with no AGI:  `r nrow(eset)` 
+
+
+#### Filter duplicated probes using IQR
+Some genes in the array have more than one probe, we can filter redundant probes and select the ones that vary the most
+```{r duplicated, echo=F}
+iqrs = apply(exprs(eset), 1, IQR) #Using interquantile range
+prbs <- findLargest(featureNames(eset), testStat = iqrs, data = "ath1121501.db")
+eset <- eset[prbs, ]
+
+## Another approach: order by IQR, keep the first (largest)
+#iqrs = apply(exprs(eset), 1, IQR)
+#eset = eset[order(iqrs, decreasing=TRUE),] ## Order first
+#paste("To remove:",sum(duplicated(fData(eset)$AGI)),"out of",nrow(eset),"multiple probes that match to one  GO term",sep=" ")
+#eset = eset[!duplicated(fData(eset)$AGI),] ## Keep the first
+
+```
+Left after removing duplicated probes:  `r nrow(eset)` 
+
+### Annotate genes
+```{r gene annotation, echo=F}
+
+fData(eset)$AGI = as.character(mget(featureNames(eset),ath1121501ACCNUM,ifnotfound=NA))
+## table(is.na(fData(eset)[1]))
+fData(eset)$Symbol = mget(featureNames(eset),ath1121501SYMBOL,ifnotfound=NA)
+# For genes with many symbols (names) collapse with a pipe
+fData(eset)$Symbol <- sapply(fData(eset)$Symbol,function(x){paste(x,collapse="|")})
+
+## If a gene has no symbol, use the AGI
+fData(eset)$Symbol[fData(eset)$Symbol == "NA"] <- fData(eset)$AGI[fData(eset)$Symbol == "NA"]
+```
+
+
+#### Calculate correlation between microarrays
+```{r CorrSamples, echo=F, message=F, warning=F, include=T}
+CorrSamples <- cor(exprs(eset))
+head(CorrSamples)
+
+library(NMF)
+aheatmap(cor(exprs(eset)), col = "-PuOr:256", 
+         annCol = pData(eset)[, c("Sample","Genotype"), drop = FALSE])
+```
+
+## Quality Control after normalization
+``` {r make tempFile, echo=F}
+tmpFileName <- paste(ResultsQC,"Normalized_Filtered_QC",sep="/")
+```
+arrayQualityMetrics output is saved in: `r tmpFileName`
+```{r QualityControl, echo=F,message=F, warning=F}
+#arrayQualityMetrics((eset), outdir=tmpFileName,
+#                   do.logtransform=TRUE, force=TRUE, spatial=FALSE, intgroup="Sample",
+#                  reporttitle="Normalized & filtered data QC")
+# --
+```
+
+# Some exploratory plots after normalization
+```{r QC plots,echo=F,message=F, fig.width=8, fig.height=7}
+# Reshaping expression data 
+meltESET <- melt(exprs(eset))
+#head(meltESET)
+colnames(meltESET) <- c("Probe","Sample","Value")
+meltESET$Type <- gsub("_rep[0-9].*$","",meltESET$Sample)
+ggplot(aes(Sample,Value,fill=Type), data=meltESET) + 
+  geom_boxplot() + #labs(title = "Normalized Expression")
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Density
+ColorSample <- selectColors(Sample)
+#ColorSample[Sample] # Assigns one color to Sample of the same group
+
+hist(eset,type="l",
+     col=ColorSample[Sample], 
+     lwd=1.5, lty=5, #line width, line type[0,6]
+     main = "Histogram of normalized microarray intensities")
+legend("topright", unique(names(ColorSample)),
+       fill = unique(ColorSample),border = F,
+       cex = 0.8,bty="n")
+#dev.off()
+#-- 
+# Clustering
+corClust = pvclust(exprs(eset), nboot=1, method.dist="correlation")
+plot(corClust,main="Clustering of normalized Sample")
+## Heatmap of correlations
+hmData <- as.matrix(cor(exprs(eset)))
+heatmap.2(hmData, col=cm.colors(256),#,hmPalette
+          ColSideColors=ColorSample[Sample],
+          #Colv=F, Rowv=F, 
+          #dendrogram = c("both","row","column","none"),
+          dendrogram = c("both"),
+          Colv=T,
+          key=T, keysize=1, symkey=F, density.info='none', 
+          trace='none', 
+          colsep=rep(1:ncol(hmData)), sepcolor='lightgray', 
+          rowsep=rep(1:nrow(hmData)), sepwidth=c(0.05,0.05),
+          #Add corr values:
+          cellnote = signif(hmData,2),notecex=0.8,notecol="black",
+          las=2, cexRow = 2,cexCol = 2,margins = c(16,16),
+          main="Correlation of Normalized Expression")
+#--
+## Get correlation between replicates below a threshold 
+tepMin <- 0.8
+tmpCor <- melt(hmData)
+tmpCor[which(tmpCor$value < tepMin),]
+
+#-- 
+## PCA
+layout(rbind(1,2), heights=c(4.5,1)) 
+#layout.show()
+pca = princomp(exprs(eset))
+par(mar=c(2,2,2,2),
+    mgp=c(2,1,0),
+    oma=c(0,0,0,0))
+plot(pca$loadings, main="PCA normalized Sample", 
+     col=ColorSample[Sample],  pch=19, cex=1)
+text(pca$loadings, colnames(exprs(eset)), pos=3, cex=0.6)
+par(mar=c(0, 0, 0, 0))
+plot.new()
+legend("center", unique(names(ColorSample)), horiz=T,
+       fill = unique(ColorSample),border = F,
+       cex = 0.8,bty="n")
+#-- 
+## Individual probes HouseKeepingGenes
+#Controls
+HKG <- c("AT1G49240","AT3G18780","AT5G25760","AT5G44340","AT5G60390") #Control genes
+HKG <- fData(eset)[fData(eset)$AGI %in% HKG,]
+hkgprobes <- rownames(HKG)
+ControlColors <- brewer.pal(length(hkgprobes),"Greys")#selectColors(hkgprobes)
+
+#GoI Genes of Interst
+GOI <- fData(eset)[fData(eset)$AGI %in% GOI,]
+goiprobes <- rownames(GOI)
+GOIColors <- selectColors(goiprobes)
+
+
+###
+print("Exploring expression of hosekeeping genes:")
+print(HKG)
+print("Exploring expression of selected genes:")
+print(GOI)
+#
+#knitr::opts_chunk$set(fig.width=2, fig.height=5)  
+layout(matrix(c(1,1,2,3), 2, 2, byrow=T),respect = F,
+       widths=c(0.5,1), 
+       heights=c(1)) #heights=c(1,2))
+# --
+par(mar=c(0,0,0,0))
+boxplot(data.frame(exprs(eset)), col="grey",las=2,cex.axis=0.8,
+        main="Normalized expression - Control", ylab="Intensity",
+        cex.main=0.7,frame.plot = FALSE)
+for (probe in seq(1,length(hkgprobes))){
+  lines(exprs(eset)[hkgprobes[probe],],lwd=2, type="b", col=ControlColors[probe])  
+}
+for (probe in seq(1,length(goiprobes))){
+  lines(exprs(eset)[goiprobes[probe],],lwd=2, type="b", col=GOIColors[probe])  
+}
+#--
+# setup for no margins on the legend
+par(mar=c(0, 0, 0, 0))# c(bottom, left, top, right)
+plot.new()
+# Control
+legend("center", HKG$Symbol, horiz=F,
+       fill = ControlColors,border = F,
+       cex = 0.8,bty="n")
+plot.new() #GOI
+legend("center", GOI$Symbol, horiz=F,
+       fill = GOIColors,border = F,
+       cex = 0.8,bty="n")
+#dev.off()
+# --
+```
+
+####Differential Expression with limma
+```{r DGE, echo=F,message=F, warning=F}
+# --
+## Create design matrix 
+Groups <- gsub("-","_",meta$Sample)
+Groups = as.factor(Groups)
+Groups <- relevel(Groups, ref=control) #Modify this variable at the start of the script
+#This is a simple model, 
+# A more complex model can be used taking into account experimental and or batch effects. 
+# Depends on experiment.
+design = model.matrix(~0+Groups) 
+#Groups is same as (Genotype*Treatment) interaction. 
+colnames(design) = levels(Groups)
+#design
+
+# --
+# Make contrasts. For better results, use VS on the name 
+contMatrix = makeContrasts(
+  #"WT_Neffect"=WT_FN-WT_noN,
+  "mutVSwt"=groupB-groupControl, #Set accordingly
+  levels=design)
+contMatrix # Compare mutants vs wt and mutants amongst them.
+
+
+# -- 
+# Array Weights
+if (doWeights) { cat( paste("Do weights"))
+                 aweights <- arrayWeightsSimple(eset)
+                 #aweights2 <- arrayWeights(eset, method="reml") # slow, and almost the same
+                 fit  <- lmFit(eset, design=design, weights=aweights) } else 
+                 {cat( paste("Don't do weights"))
+                 fit  <- lmFit(eset, design=design, weights=aweights) }
+fit = contrasts.fit(fit,contMatrix)
+fit = eBayes(fit)
+
+
+# -- 
+## Venn diagram
+if (doVenn) { cat( paste("Do Venn diagrams"))
+  #pdfPath <- paste(Images,"Venn.pdf",sep="/")
+  #pdf(pdfPath,width=9, height=9)
+  results = decideTests(fit)
+  vennDiagram(results,cex=0.7) 
+} else {
+  paste("Skipping Venn Diagrams")}
+
+
+# -- 
+## Filter by IQR for DiffExpr analysis
+if (IQRfilter) {
+  cat( paste("Filtering by IQR"))
+  IndexfitPass <- names(which(passIqr)) %in% rownames(fit$genes)
+  table(IndexfitPass)
+  fit <- fit[which(IndexfitPass),]
+  dim(fit)
+} else {cat( paste("Not filtering by IQR"))}
+
+### Save data
+
+## Anova or contrasts?
+if (ANOVA){
+  #ANOVA, all contrasts
+  cat("Doing ANOVA for DGE \n")
+  DE <- topTable(fit, number=nrow(fit),adjust="BH")
+  paste("Number of genes with adjPVal<0.05: ", nrow(DE[DE$adj.P.Val < 0.05,]), sep="")
+  
+} else { 
+  #Individual contrasts
+  cat("Doing individual contrasts for DGE \n")
+  ListTop <- list()
+  Contrast <- colnames(contMatrix)
+  for (each in Contrast){
+    print (paste("Contrast: ",each))
+    ListTop[[each]] <- topTable(fit, number=nrow(fit), coef=each,sort.by="p")
+    ## number=all genes in microarray
+    ## sorted by Pvalue
+    
+    ##Save each table
+    savePath <- paste(DiffExprPath,"/",each,".txt",sep="")
+    write.table(as.data.frame(ListTop[[each]]), file=savePath, row.names=T, col.names=T,sep="\t", quote=F)
+    ##
+    print(paste("Significant DE genes:",(sum(ListTop[[each]]$adj.P.Val < 0.05)),"out of",nrow(ListTop[[each]]),sep=" "))
+    #print(sum(abs(ListTop[[each]]$logFC) > log2(1.5)))
+    }
+  saveTop <- paste(DiffExprPath,"ListTop.RData",sep="/")
+  save(ListTop, file=saveTop)
+  
+  ############# Collapse into a single table
+  #Meta
+  OrderProbes <- rownames(fit)
+  KeepColumns <- !(unique(unlist(lapply(ListTop, colnames))) %in% colnames(fData(eset)))
+  
+  DE <- do.call("cbind", lapply(ListTop, function(x) {x[OrderProbes,KeepColumns]}))
+  rownames(DE) <- OrderProbes
+  DE <- cbind(DE,fData(eset)[rownames(DE),])
+  
+}
+rownames(DE) <- DE$AGI
+#
+if (ncol(contMatrix) == 1) {  
+colnames(DE)[grep("logFC",colnames(DE))] <- colnames(contMatrix)
+}
+#
+head(DE)
+```
+
+
+```{r post DE images,echo=F,message=F, fig.width=8, fig.height=7}
+############# Differential Expression
+cat("Doing individual contrasts for volcano plots",
+    "\nContrasts:",paste(colnames(contMatrix), collapse = ", "))
+
+
+# normalize colnames for columns corresponding to logFC 
+#colnames(DE)[!colnames(DE) %in% c("AGI","Symbol","AveExpr","t","P.Value","adj.P.Val","B")] <- #colnames(contMatrix) 
+#or paste(colnames(contMatrix),"_logFC",sep = "")
+colnames(DE)
+
+for (contrast in colnames(contMatrix)) {
+  #print (contrast)
+  #volcanoplot(fit, coef = each, highlight=10, names=fit$genes$Symbol,
+  #            xlab="Log Fold Change", ylab="Log Odds", main=each, 
+  #            cex.main=0.8, cex=0.7)
+  
+  # Subset by column
+  if(ANOVA){
+    # For ANOVA
+    SelectColumns <- c("Symbol",contrast,"P.Value","adj.P.Val")
+  } else {
+    # For multiple contrasts
+    SelectColumns <- c("Symbol",paste(contrast,c("logFC","P.Value","adj.P.Val"),sep="."))
+  } 
+  # --
+  res <- DE[,colnames(DE) %in% SelectColumns]
+  colnames(res) <- c('Gene','logFC','pVal','pAdj')
+  res$Gene <- gsub("\\|.*$","",res$Gene) #If symbol has multiple names, use only the first one.
+  #head(res)
+  
+  # Make a basic volcano plot
+  with(res, plot(logFC, -log10(pVal), pch=".", 
+                 main=paste("Volcano plot of",contrast,sep=" "), 
+                 ylim=c(0,max(-log10(res$pVal))+5),   
+                 xlim=c(min(res$logFC)-4,max(res$logFC)+4)))
+  
+  # Add colored points: red if padj<0.05, orange of log2FC>1, green if both)
+  with(subset(res, pAdj<.05 ), points(logFC, -log10(pVal), pch="*", col="red"))
+  with(subset(res, abs(logFC)>2), points(logFC, -log10(pVal), pch=20, col="orange"))
+  with(subset(res, pAdj<.05 & abs(logFC)>2), points(logFC, -log10(pVal), pch=20, col="green"))
+  # Label points with the textxy function from the calibrate plot
+  
+  with(subset(res, pAdj<.05 & abs(logFC)>2), 
+       textxy(logFC, -log10(pVal), labs=Gene, cex=.5))
+  legend("topright", c("AdjpVal < 0.05",
+                       "logFC > 2",
+                       "pVal&logFC"),
+         fill = c("red","orange","green"),border = F,
+         cex = 0.8,bty="n")
+  abline(v = c(2,-2),col="skyblue",lty = 2)
+}
+```
+
+
+
+
+``` {r filter significant DE genes,echo=F,message=F}
+# Color selection
+colfunc <- colorRampPalette(
+    c("orange", "gold",
+      "white",
+      "cyan","purple"),
+    space="Lab")
+hm.OGWCYP <- colfunc(150)
+
+##
+if (ncol(contMatrix) != 1) { 
+  print("Printing heatmaps to PDF")
+  ##
+  ContrastType <- gsub("_*$","",colnames(contMatrix)) 
+  Sign.DE <- as.matrix(DE[DE$adj.P.Val <= 0.05,colnames(DE) %in% colnames(contMatrix),drop=F])
+  name = gsub("/.*$","",inDir)
+## SignDE   
+if (nrow(Sign.DE) != 0) {
+  print("Significant DE genes to PDF")
+  pdfPath <- paste(Images,"/FullHM_",name,'.pdf',sep="")
+  pdf(pdfPath,width = 13,height = 40)
+  hmFunction(Sign.DE,hm.OGWCYP,0.2,"adjPval < 0.05")
+  dev.off()
+## SignDE logFC max > 1.5
+Idx <- which(apply(abs(Sign.DE),1,max) > 1.5)
+if(length(Idx) > 2){
+  print("Significant DE max FC > 1.5 to PDF")
+  pdfPath <- paste(Images,"/maxFC_HM_",name,'.pdf',sep="")
+  pdf(pdfPath,width = 13,height = 40)
+  hmFunction(Sign.DE[Idx,,drop=F],hm.OGWCYP,1.5,"max logFC > 1.5")
+  dev.off()
+}
+## SignDE logFC min > 0.5
+Idx <- which(apply(abs(Sign.DE),1,min) > 0.5)  
+if(length(Idx) > 2){
+  print("Significant DE min FC > 0.5 to PDF")
+  pdfPath <- paste(Images,"/minFC_HM",name,'.pdf',sep="")
+  pdf(pdfPath,width = 13,height = 40)
+  hmFunction(Sign.DE[Idx,,drop=F],hm.OGWCYP,1.5,"minlogFC > 1.5")
+  dev.off()
+}
+}
+# --   
+} else{ 
+  print("Skipping heatmaps")
+  Sign.DE <- as.matrix(DE[DE$adj.P.Val <= 0.05,colnames(DE) %in% colnames(contMatrix),drop=F])
+}
+
+#   
+```
+
+### Saving data 
+```{r savingfiles , echo=F}
+# Saving full DGE table
+tmpExprs <- exprs(eset)
+rownames(tmpExprs) <- fData(eset)[rownames(tmpExprs),"AGI"]
+colnames(tmpExprs) <- paste("NormExprs",colnames(tmpExprs),sep="_")
+tmpExprs <- cbind(DE[rownames(tmpExprs),],tmpExprs)
+
+# Full
+tmpFileName <- paste(DiffExprPath,"/DGE_all_",basename(inDir),".csv",sep="")
+paste("Writing file:",tmpFileName)
+write.csv(tmpExprs, file = tmpFileName,
+            row.names=T, quote=F)
+# Significant
+tmpFileName <- paste(DiffExprPath,"/DGE_significant_",basename(inDir),".csv",sep="")
+paste("Writing file:",tmpFileName)
+write.csv(tmpExprs[rownames(Sign.DE),], file = tmpFileName,
+            row.names=T, quote=F)
+# To read back the files use:
+#read.csv(tmpFileName,header = T,row.names = 1)
+# -- 
+
+# Correlation
+tmpFileName <- paste(DiffExprPath,"/CorrelationMAs",basename(inDir),".csv",sep="")
+paste("Writing file:",tmpFileName)
+write.csv(CorrSamples, file = tmpFileName,
+            row.names=T, quote=F)
+# To read back the files use:
+#read.csv(tmpFileName,header = T,row.names = 1)
+# -- 
+# Save RData object
+SaveData <- paste(ResultsNorm,"/SavedData_",
+                  gsub("/","",inDir),
+                       ".Rdata",sep="")
+cat( paste("Saving data in:",ResultsNorm,"\n"))
+save(eset, design, contMatrix, fit, DE, Sign.DE,file=SaveData)
+```
+
